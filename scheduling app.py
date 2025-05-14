@@ -1,5 +1,10 @@
 import openpyxl
 from openpyxl.utils import get_column_letter
+from openpyxl.formatting.rule import CellIsRule, FormulaRule
+
+
+from openpyxl.styles import Font
+from openpyxl.styles import PatternFill
 import pandas as pd
 import random
 import calendar
@@ -401,17 +406,20 @@ def enforce_max_days_off(df_schedule, df_team):
 
             elif rdo_balance > 0:
                 working_rows = week_data[week_data["shift_time"] != "RDO"]
-                rows_to_change = working_rows.sample(n=rdo_balance).index
-                for idx in rows_to_change:
-                    target_day = df_schedule.loc[idx, "Day"]
-                    assign_one_agent(df_schedule, target_day.day_name(), "RDO", agent)
+                if len(working_rows) >= rdo_balance and rdo_balance > 0:
+                    rows_to_change = working_rows.sample(n=rdo_balance).index
+                    for idx in rows_to_change:
+                        target_day = df_schedule.loc[idx, "Day"]
+                        assign_one_agent(df_schedule, target_day.day_name(), "RDO", agent)
+                else:
+                    print(f"⚠️ Not enough working rows to reduce RDOs for agent {agent}")
     return df_schedule
 
 def smt_check(df_schedule, df_team):
     team_shifts = ["9", "13", "15"]
     smt_team = df_team[df_team["trained_social"] == True]["name"].tolist()
     grouped = df_schedule.groupby(["Day", "shift_time"])
-
+    smts_present = []
     for (day, shift), group_df in grouped:
         if shift not in team_shifts:
             continue
@@ -461,7 +469,7 @@ def check_and_fill_smt(df_schedule, shift_requirements, df_team):
 
     return df_schedule
 
-def output_schedule(excel_file_path):
+def output_schedule(excel_file_path, destination_file_path):
     wb = openpyxl.load_workbook(excel_file_path)
     # 🗓️ Step 1: Get next and previous months
     try:
@@ -556,12 +564,65 @@ def output_schedule(excel_file_path):
         new_sheet.cell(row=latest_row, column=col).value = (f"={col_letter}{latest_row-3}+"
                                                                      f"{col_letter}{latest_row-2}+"
                                                                      f"{col_letter}{latest_row-1}")
+    #STEP 7: Conditional formatting
+    rrdo_fill = PatternFill(start_color="FF707071", end_color="FF707071", fill_type="solid")
+    rrdo_rule = CellIsRule(operator='equal', formula=['"RRDO"'], fill=rrdo_fill)
+    rdo_fill = PatternFill(start_color="FF908e92", end_color="FF908e92", fill_type="solid")
+    rdo_rule = CellIsRule(operator='equal', formula=['"RDO"'], fill=rdo_fill)
+    morning_fill = PatternFill(start_color="FFf9f7fb", end_color="FFf9f7fb", fill_type="solid")
+    morning_rule = CellIsRule(operator='equal', formula=['"9"'], fill=morning_fill)
+    early_late_fill = PatternFill(start_color="FFc27aff", end_color="FFc27aff", fill_type="solid")
+    early_late_rule = CellIsRule(operator='equal', formula=['"13"'], fill=early_late_fill)
+    late_late_fill = PatternFill(start_color="FF8903fb", end_color="FF8903fb", fill_type="solid")
+    late_late_rule = CellIsRule(operator='equal', formula=['"15"'], fill=late_late_fill)
+    al_fill = PatternFill(start_color="FF2596be", end_color="FF2596be", fill_type="solid")
+    al_rule = CellIsRule(operator='equal', formula=['"AL"'], fill=al_fill)
+    from openpyxl.formatting.rule import FormulaRule
+    off_fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
+    off_font = Font(color="FFFFFF")  # white text
+
+    off_rule = FormulaRule(formula=[f'LOWER(C3)="off"'], fill=off_fill, font=off_font)
+    range_str = f"C3:{get_column_letter(new_sheet.max_column)}{new_sheet.max_row}"
+
+    new_sheet.conditional_formatting.add(range_str, rdo_rule)
+    new_sheet.conditional_formatting.add(range_str, rrdo_rule)
+    new_sheet.conditional_formatting.add(range_str, morning_rule)
+    new_sheet.conditional_formatting.add(range_str, early_late_rule)
+    new_sheet.conditional_formatting.add(range_str, late_late_rule)
+    new_sheet.conditional_formatting.add(range_str, al_rule)
+    new_sheet.conditional_formatting.add(range_str, off_rule)
 
 
-    # 💾 Step 6: Save updated file
-    wb.save("Team Rota 2024-2025 - Team_updated.xlsx")
+    # 💾 Step 8: Save updated file
+    wb.save(destination_file_path)
+    sheet_name = next_sheet_name
+    return sheet_name, start_date, end_date
 
 
+
+def fill_schedule(df_team, df_schedule, destination_file_path, sheet_name):
+    wb = openpyxl.load_workbook(destination_file_path)
+    sheet = wb[sheet_name]
+    staff_list = df_team["name"].tolist()
+
+    for staff in staff_list:
+        # filter for agent in df_schedule
+        df_agent = df_schedule[df_schedule["Employee"] == staff]
+        for row in sheet.iter_rows(min_row=3, max_col=2):
+            if row[1].value == staff:
+                row_to_fill = row[1].row
+
+        for col_cells in sheet.iter_cols(max_row=1, min_col=3):
+            for cell in col_cells:
+                wb_date = cell.value
+                col_idx = cell.column
+                if isinstance(wb_date, datetime):
+                    wb_date = wb_date.date()
+                for _, row in df_agent.iterrows():
+                    if wb_date == row["Day"].date():  # assuming column is "Day"
+                        sheet.cell(row=row_to_fill, column=col_idx).value = row["shift_time"]
+    # save wb
+    wb.save(destination_file_path)
 
 
 ####MAIN####
@@ -569,6 +630,8 @@ def output_schedule(excel_file_path):
 # 📁 1. File setup
 # ---------------------------
 excel_file = "/home/julien/Documents/PycharmProjects/PythonschedulingNEW/Team Rota 2024-2025 - Team.xlsx"
+source = "/home/julien/Documents/PycharmProjects/PythonschedulingNEW/Team Rota 2024-2025 - Team.xlsx"
+destination_file_path = "/home/julien/Documents/PycharmProjects/PythonschedulingNEW/Team Rota 2024-2025 - Team_updated.xlsx"
 
 
 # ▶️ 1.a Load your shift-requirements sheet once
@@ -593,11 +656,12 @@ df_team = df_team.rename(columns={
 # ---------------------------
 # 🗓️ 3. Create empty schedule
 # ---------------------------
+sheet_name, start_date, end_date = output_schedule(source, destination_file_path)
 df_schedule = create_schedule_structure(
     df_holidays=None,
     employee_list=employee_list["name"].tolist(),
-    start_date="2025-04-01",
-    end_date="2025-04-30"
+    start_date=start_date,
+    end_date=end_date
 )
 
 # 3.5 extract SMT staff
@@ -669,8 +733,7 @@ df_schedule = check_and_fill_smt(df_schedule, shift_requirements, df_team)
 print("\n–– SMT Coverage After Fill ––")
 print(report_smt_coverage(df_schedule, df_team))
 
-output_schedule("/home/julien/Documents/PycharmProjects/PythonschedulingNEW/Team Rota 2024-2025 - Team.xlsx")
-
+fill_schedule(df_team, df_schedule, destination_file_path, sheet_name)
 
 """""
 sat_morning_check = df_schedule[
@@ -718,3 +781,5 @@ for team, label in [(sat_morning_team, "Morning"), (saturday_evening_team, "Even
             (df_schedule["shift_time"] == "RDO")
         ].shape[0]
         print(f"  {agent} ➜ {off_count} weekday OFF(s)")"""
+
+
