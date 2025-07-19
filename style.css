@@ -1,0 +1,18 @@
+/* in your main stylesheet (e.g. styles.css) */
+body {
+  font-family: 'Montserrat', sans-serif;
+  font-weight: 400;      /* regular for body text */
+  line-height: 1.5;       /* nice readability */
+  letter-spacing: 0.02em; /* subtle looseness */
+  color: #333;            /* dark grey, easy on the eyes */
+  font-size: 12px;
+}
+h1{
+color: #01ABDD;
+font-weight: 100;
+}
+/* headings slightly bolder: */
+h2, h3, h4, h5, h6 {
+  font-weight: 200;       /* bold for headings */
+  letter-spacing: 0.03em;
+}

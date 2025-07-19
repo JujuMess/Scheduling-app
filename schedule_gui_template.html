@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <!-- in your <head> -->
+    <link
+      href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;700;800&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/static/css/style.css">
+
+    <title>Primark Schedule Maker</title>
+    <img src="{{ url_for('static', filename='img/primark.png') }}" alt="Primark logo", size="250px">
+        <h1 style="padding-left:30px; font-size:30px;">TEAM SCHEDULE MAKER</h1>
+<!-- inside, say, templates/form.html -->
+
+</head>
+<body>
+    <h2>Please read carefully the instructions:</h2>
+    <h2>Handle your source file with care.</h2>
+    <h3>
+        - Do not rename tabs.<br>
+        - Leave the previous month tab so the team's history can be loaded properly.<br>
+        - Change only the required in the green tabs, no need to change the other ones.<br>
+        - Stick to RDO, OFF (for AL) and the time format for days worked when manually editing the schedule. <br>
+        The rest won't be picked up.
+    </h3>
+
+    <h2>If first use of this app:</h2>
+    <h3>
+        - Please add tabs of all the previous months to take into account and press "Load History".<br>
+        - For next uses, only the previous month and no need to load history.<br>
+    </h3>
+    <h2>How does it work?</h2>
+    <h3>The program will take all the needed information from the source file (names, trainings, languages, shift , etc...)<br>
+    It will lock the people who took AL from the AL calendar <br>
+    It will assign the whole team 9-18 Monday to Friday shifts <br>
+    Then it will pull the people with less late shifts and assign them nigh shifts for the week.<br>
+    If people have the same number of night shifts, it will take the one who has their last shift the longer before <br>
+    Same thing for Saturday shifts and late Saturday shifts <br>
+    It will assign another RDO to people who work less than 5 days a week or who are in on Saturday <br>
+
+    ⚠️ Sunday and other shifts not supported, they will need to be added manually, <br>
+    ⚠️ There is no C&C or SS logic (they could all be all off and require manual editing. <br>
+    ⚠️ New hires treated the same as tenured agents. <br>
+    <br>
+    <br>
+    🛠️ ⏳ For the V2: Implement the Chat team too, take into account the NH, TC, C&C+SS <br>
+    and social media team, include Sunday shifts, and tailored starting time (people starting at 8 or odd times). <br>
+    Create new tabs with a social media rota automatically made from the schedule.
+    </h3>
+
+    <form method="POST" enctype="multipart/form-data">
+        <label>📁 Select source Excel file:</label><br>
+        <input type="file" name="myfile" required><br><br>
+
+        <label for="output_folder">📂 Enter output folder (no file name):</label>
+        <input type="text" name="output_folder" required>
+        <small style="color: gray;">⚠️ Only paste an existing folder. Do not include the file name.</small>
+
+
+        <input type="submit" value="✅ Run Schedule">
+    </form>
+
+    {% if mismatches %}
+  <div class="alert alert-warning" style="margin-top: 20px;">
+    <h3>⚠️ Staff Mismatches</h3>
+
+      {% if mismatches.missing_in_team %}
+    <p><strong>Seem to have left the team (not scheduled):</strong></p>
+    <ul>
+      {% for name in mismatches.missing_in_team %}
+        <li>{{ name }}</li>
+      {% endfor %}
+    </ul>
+  {% endif %}
+
+  {% if mismatches.new_in_team %}
+    <p><strong>New in Team (added to History):</strong></p>
+    <ul>
+      {% for name in mismatches.new_in_team %}
+        <li>{{ name }}</li>
+      {% endfor %}
+    </ul>
+  {% endif %}
+
+  {% if mismatches.used_not_in_team %}
+    <p><strong>Present in schedule, not in Team tab (⚠️ ghost names):</strong></p>
+    <ul>
+      {% for name in mismatches.used_not_in_team %}
+        <li>{{ name }}</li>
+      {% endfor %}
+    </ul>
+  {% endif %}
+
+  {% if mismatches.in_team_not_used %}
+    <p><strong>Present in Team tab but never used in the schedule:</strong></p>
+    <ul>
+      {% for name in mismatches.in_team_not_used %}
+        <li>{{ name }}</li>
+      {% endfor %}
+    </ul>
+  {% endif %}
+{% endif %}
+
+
+
+    {% if result %}
+    <p style="color: green;">{{ result }}</p>
+{% endif %}
+
+    {% if error %}
+    <p style="color: red;">❌ {{ error }}</p>
+{% endif %}
+
+
+</body>
+</html>
