@@ -314,8 +314,6 @@ def update_history(df_history, df_week,weekday_late_late=None, weekday_early_lat
                 df_history.loc[df_history["name"] == name, "latest_saturday_morning"] = latest_day.strftime("%Y-W%U")
 
     return df_history
-
-
 # Revised assign_both_late_shifts: pre‐select SMT to cover both early_late & late_late,
 # then fill any remaining slots with non‐SMT to meet overall headcount.
 def assign_both_late_shifts(df_week, df_history, df_team, grouped_smt_team, shift_requirements):
@@ -412,7 +410,7 @@ def assign_both_late_shifts(df_week, df_history, df_team, grouped_smt_team, shif
             assign_one_agent(df_week, d, "13", name)
     df_week.loc[df_week["Employee"].isin(early_late_team), "assigned_weekly_13"] = True
 
-    return df_week, df_history, late_late_team, early_late_team
+    return df_week, late_late_team, early_late_team
 
 def enforce_minimum_staffing(df_schedule, shift_requirements):
     """
@@ -552,6 +550,8 @@ def assign_saturday_shifts(df_week, df_history, df_team, grouped_smt_team, shift
         ~df_team["name"].isin(already_lated),
         "name"
     ].tolist()
+    print("📊 All SMT candidates available:")
+    print(df_team[df_team["trained_social"] == True][["name", "team"]])
 
     sat_late_late_team = []
     sat_early_late_team = []
@@ -561,6 +561,11 @@ def assign_saturday_shifts(df_week, df_history, df_team, grouped_smt_team, shift
     # 1. Assign Saturday 15:00 (late-late)
     while len(sat_late_late_team) < requirement_15:
         smt_requirement = shift_requirements.loc["15", "smt_needed"]
+
+        raw_smt = df_team[df_team["trained_social"] == True]["name"].tolist()
+        print("👀 SMTs available BEFORE fairness check:", raw_smt)
+        print("🧾 Counts in df_history:")
+        print(df_history[df_history["name"].isin(raw_smt)][["name", "count_saturday_late_late"]])
         fair_sat15 = select_fairest(
             df_history, df_team, saturday_eligible,
             shift_type="saturday_late_late",
@@ -569,10 +574,12 @@ def assign_saturday_shifts(df_week, df_history, df_team, grouped_smt_team, shift
             filter_func=lambda row: row["team"] not in used_languages_late and row["trained_social"],
             duplicate_teams=False
         )
+        print("✅ SMTs selected for fairness (Sat 15):", fair_sat15["name"].tolist())
+
         if fair_sat15.empty:
             print("❌ No eligible candidate for Saturday 15:00 (late-late)")
             print("🔁 RETURNING EMPTY LISTS")
-            return df_week, df_history, [], []
+            return df_week, [], []
         name = fair_sat15["name"].iloc[0]
         lang = df_team.loc[df_team["name"] == name, "team"].iloc[0]
         used_languages_late.add(lang)
@@ -581,6 +588,11 @@ def assign_saturday_shifts(df_week, df_history, df_team, grouped_smt_team, shift
     # 2a. Assign one SMT for 13:00 (early-late)
     if requirement_13 > 0:
         smt_requirement = shift_requirements.loc["13", "smt_needed"]
+        raw_smt = df_team[df_team["trained_social"] == True]["name"].tolist()
+        print("👀 SMTs available BEFORE fairness check:", raw_smt)
+        print("🧾 Counts in df_history:")
+        print(df_history[df_history["name"].isin(raw_smt)][["name", "count_saturday_late_late"]])
+
         fair_smt = select_fairest(
             df_history, df_team, saturday_eligible,
             shift_type="saturday_early_late",
@@ -589,17 +601,26 @@ def assign_saturday_shifts(df_week, df_history, df_team, grouped_smt_team, shift
             filter_func=lambda row: row["team"] not in used_languages_late and row["trained_social"],
             duplicate_teams=False
         )
+        print("✅ SMTs selected for fairness (Sat 13):", fair_smt["name"].tolist())
+
         if fair_smt.empty:
             print("❌ No SMT candidate for Saturday 13:00 (early-late)")
             print("🔁 RETURNING EMPTY LISTS")
-            return df_week, df_history, [], []
+            return df_week, [], []
         smt_name = fair_smt["name"].iloc[0]
         lang = df_team.loc[df_team["name"] == smt_name, "team"].iloc[0]
         used_languages_late.add(lang)
         sat_early_late_team.append(smt_name)
+    print("📉 SMTs after filtering for 15:00:", fair_sat15["name"].tolist())
+    print("📉 SMTs after filtering for 13:00:", fair_smt["name"].tolist())
 
     # 2b. Fill remaining 13:00 slots
     while len(sat_early_late_team) < requirement_13:
+        raw_smt = df_team[df_team["trained_social"] == True]["name"].tolist()
+        print("👀 SMTs available BEFORE fairness check:", raw_smt)
+        print("🧾 Counts in df_history:")
+        print(df_history[df_history["name"].isin(raw_smt)][["name", "count_saturday_late_late"]])
+
         fair_sat13 = select_fairest(
             df_history, df_team, saturday_eligible,
             shift_type="saturday_early_late",
@@ -611,7 +632,7 @@ def assign_saturday_shifts(df_week, df_history, df_team, grouped_smt_team, shift
         if fair_sat13.empty:
             print("❌ No non-SMT candidate for Saturday 13:00 (early-late)")
             print("🔁 RETURNING EMPTY LISTS")
-            return df_week, df_history, [], []
+            return df_week, [], []
         name = fair_sat13["name"].iloc[0]
         lang = df_team.loc[df_team["name"] == name, "team"].iloc[0]
         used_languages_late.add(lang)
@@ -632,7 +653,7 @@ def assign_saturday_shifts(df_week, df_history, df_team, grouped_smt_team, shift
 
     print("✅ END assign_saturday_shifts")
     print("🔁 RETURNING NORMAL VALUES")
-    return df_week, df_history, sat_late_late_team, sat_early_late_team
+    return df_week, sat_late_late_team, sat_early_late_team
 
 def assign_saturdays_and_rdo(df_week, df_team, shift_requirements, df_history, sat_late_late_team, sat_early_late_team):
     # ────────── Step 1: Assign Saturday morning ("9") SMT ──────────
@@ -849,9 +870,10 @@ def apply_weekly_shift_logic(df_schedule, df_team, grouped_smt_team, shift_requi
         print(f"\n🗖 Assigning shifts for week {week}")
         weekly_mask = df_schedule["week_id"] == week
         df_week = df_schedule[weekly_mask].copy()
+        df_week["Weekday"] = df_week["Day"].dt.weekday
 
         # 1. Assign weekday late-late and early-late shifts
-        df_week, df_history, late_late_team, early_late_team = assign_both_late_shifts(
+        df_week, late_late_team, early_late_team = assign_both_late_shifts(
             df_week, df_history, df_team, grouped_smt_team, shift_requirements
         )
 
@@ -873,7 +895,7 @@ def apply_weekly_shift_logic(df_schedule, df_team, grouped_smt_team, shift_requi
         if result is None:
             raise RuntimeError("❌ assign_saturday_shifts() returned None unexpectedly!")
 
-        df_week, df_history, sat_late_late_team, sat_early_late_team = result
+        df_week, sat_late_late_team, sat_early_late_team = result
 
         # 2. Assign Saturday shifts
         # … after weekday shifts and history update …
@@ -886,6 +908,10 @@ def apply_weekly_shift_logic(df_schedule, df_team, grouped_smt_team, shift_requi
             sat_late_late_team,
             sat_early_late_team
         )
+        print("🧪 SMT assigned to Sat 15:", sat_late_late_team)
+        print("🧪 SMT assigned to Sat 13:", sat_early_late_team)
+        print("🧪 Sat morning team:", sat_morning_team)
+        print(df_week[df_week["Day"].dt.dayofweek == 5][["Day", "Employee", "shift_time"]])
 
         # 🔥 FIX: update history for Saturday shifts too
         df_history = update_history(
@@ -894,6 +920,8 @@ def apply_weekly_shift_logic(df_schedule, df_team, grouped_smt_team, shift_requi
             saturday_early_late=sat_early_late_team,
             saturday_morning=sat_morning_team
         )
+        print("📈 History counts after update:\n",
+              df_history[["name", "count_saturday_late_late"]].sort_values("count_saturday_late_late", ascending=False))
 
         # 3. Apply staffing rules
         df_week = enforce_minimum_staffing(df_week, shift_requirements)
@@ -954,10 +982,20 @@ def output_schedule(excel_file_path, destination_file_path):
     month = next_month.month
 
     # 📁 Step 2: Load workbook and create new sheet from base
-    base_sheet = wb[base_sheet_name]
-    new_sheet = wb.copy_worksheet(base_sheet)
-    new_sheet.title = next_sheet_name
-    print(f"New tab '{next_sheet_name}' created successfully")
+    # 📁 Step 2: Load workbook and create new sheet from base
+    if base_sheet_name not in wb.sheetnames:
+        raise RuntimeError(f"❌ Base sheet '{base_sheet_name}' not found! Sheets found: {wb.sheetnames}")
+
+    try:
+        base_sheet = wb[base_sheet_name]
+        new_sheet = wb.copy_worksheet(base_sheet)
+        new_sheet.title = next_sheet_name
+        print(f"📄 Sheetnames before saving: {wb.sheetnames}")
+        print(f"✅ Copied new tab: {new_sheet.title}")
+    except Exception as e:
+        raise RuntimeError(f"❌ Failed to copy base sheet: {e}")
+
+    print("✅ Available sheets:", wb.sheetnames)
 
     # 📅 Step 3: Determine start and end date
     try:
@@ -1036,315 +1074,108 @@ def output_schedule(excel_file_path, destination_file_path):
 
     # 💾 Step 8: Save updated file
     wb.save(destination_file_path)
+
+    # 🧪 Reload and verify the sheet was actually created
+    wb = openpyxl.load_workbook(destination_file_path)
+    if next_sheet_name not in wb.sheetnames:
+        raise RuntimeError(f"❌ Tab '{next_sheet_name}' was not saved correctly in {destination_file_path}")
+
+    # ✅ Return metadata
     sheet_name = next_sheet_name
     return sheet_name, start_date, end_date, pd.date_range(start=start_date, end=end_date)
 
+import sys
 
+def dbg(*args):
+    print(*args, flush=True, file=sys.stdout)
 
+# then replace every print(...) in load_employee_history with dbg(...)
 def load_employee_history(file_path):
-    print("loading employee history")
+
+    from dateutil.parser import parse
+
+    print("📥 load_employee_history: starting with", file_path)
     unrecognized_cells = []
+
+    # ─── 1) Try to load the History sheet ────────────────────────────────
     try:
-        df_history = pd.read_excel(file_path, sheet_name="History", usecols="B:L")
-        df_history.columns = df_history.columns.str.strip().str.lower()
-        df_history = df_history.rename(columns={"agent's name": "name"})
-
-        default_zero_cols = [
-            "count_early_late", "count_late_late",
-            "count_saturday_morning", "count_saturday_early_late", "count_saturday_late_late"
-        ]
-        for col in default_zero_cols:
-            if col not in df_history:
-                df_history[col] = 0
-            df_history[col] = df_history[col].fillna(0).astype(int)
-
-        for col in df_history.columns:
-            if col.startswith("latest_"):
-                df_history[col] = df_history[col].astype(object)
-
-        df_history = df_history.where(pd.notnull(df_history), None)
-
-        default_none_cols = [
-            "team", "trained_social", "t3_trained", "days_per_week",
-            "latest_early_late", "latest_late_late",
-            "latest_saturday_morning", "latest_saturday_early_late", "latest_saturday_late_late"
-        ]
-        for col in default_none_cols:
-            if col not in df_history.columns:
-                df_history[col] = None
-
-        for col in default_zero_cols:
-            if col not in df_history.columns:
-                df_history[col] = 0
-
-        if df_history["days_per_week"].isnull().any():
-            df_history["days_per_week"] = (
-                df_history["days_per_week"]
-                .fillna(5)
-                .infer_objects()
-                .astype(int)
-            )
-
-        # Load latest schedule sheet for downstream use
-        wb = openpyxl.load_workbook(file_path, data_only=True)
-        sheet_dates = []
-        for sheet_name in wb.sheetnames:
-            try:
-                parsed = parse(sheet_name)
-                sheet_dates.append((sheet_name, parsed))
-            except:
-                continue
-        sorted_sheets = sorted(sheet_dates, key=lambda x: x[1])
-        latest_sheet_name = sorted_sheets[-1][0]
-        schedule_sheet = wb[latest_sheet_name]
-
-        return df_history, unrecognized_cells, schedule_sheet
-
+        df = pd.read_excel(file_path, sheet_name="History", usecols="B:L")
+        print("✅ History sheet read, shape:", df.shape)
     except Exception as e:
-        print(f"Error {e}: No History tab in the source document, creating new History tab")
+        print(f"⚠️ Cannot read History sheet — {e}")
+        print("   falling back to Team sheet for history initialization")
         try:
-            df_history = pd.read_excel(file_path, sheet_name="Team", usecols="B:L")
-            df_history.columns = df_history.columns.str.strip().str.lower()
-            df_history = df_history.rename(columns={
-                "agent's name": "name",
-                "team": "team",
-                "trained social": "trained_social",
-                "tier 3 trained": "t3_trained",
-                "days per week": "days_per_week"
-            })
-            df_history = df_history.dropna(how="all")
+            df = pd.read_excel(file_path, sheet_name="Team", usecols="B:L")
+            print("✅ Team sheet read instead, shape:", df.shape)
+            # drop entirely blank rows
+            df = df.dropna(how="all")
+        except Exception as e2:
+            dbg(f"❌ Cannot read Team sheet either — {e2}")
+            raise RuntimeError("No History or Team sheet found") from e2
 
-            for col in [
-                "latest_early_late", "latest_late_late",
-                "latest_saturday_morning", "latest_saturday_early_late", "latest_saturday_late_late"
-            ]:
-                df_history[col] = None
+    # ─── 2) Clean & normalize df_history ─────────────────────────────────
+    df.columns = df.columns.str.strip().str.lower()
+    # rename agent's name → name if present
+    if "agent's name" in df.columns:
+        df = df.rename(columns={"agent's name": "name"})
+        dbg("   renamed \"agent's name\" → \"name\"")
+    else:
+        dbg("   warning: no \"agent's name\" column to rename")
 
-            for col in [
-                "count_early_late", "count_late_late",
-                "count_saturday_morning", "count_saturday_early_late", "count_saturday_late_late"
-            ]:
-                df_history[col] = 0
+    # ensure all the count_... cols exist as ints
+    zero_cols = [
+        "count_early_late", "count_late_late",
+        "count_saturday_morning", "count_saturday_early_late", "count_saturday_late_late"
+    ]
+    for c in zero_cols:
+        df[c] = df.get(c, 0).fillna(0).astype(int)
+    dbg("   ensured zero-count columns")
 
-            df_history["days_per_week"] = df_history["days_per_week"].astype(int)
+    # ensure all the latest_... cols exist as object
+    latest_cols = [
+        "latest_early_late", "latest_late_late",
+        "latest_saturday_morning", "latest_saturday_early_late", "latest_saturday_late_late"
+    ]
+    for c in latest_cols:
+        df[c] = df.get(c, None)
+    dbg("   ensured latest-date columns")
 
-            wb_history = openpyxl.load_workbook(file_path)
-            sheet_dates = []
-            for sheet_name in wb_history.sheetnames:
-                try:
-                    parsed = parse(sheet_name)
-                    sheet_dates.append((sheet_name, parsed))
-                except:
-                    continue
-            sorted_sheets = sorted(sheet_dates, key=lambda x: x[1])
-            latest_sheet_name = sorted_sheets[-1][0]
-            schedule_sheet = wb_history[latest_sheet_name]
+    # fill days_per_week default if missing
+    if "days_per_week" not in df.columns or df["days_per_week"].isnull().any():
+        if "days_per_week" not in df.columns:
+            df["days_per_week"] = 5
+        else:
+            df["days_per_week"] = df["days_per_week"].fillna(5).astype(int)
 
-            early_late_counted = set()
-            sat_early_late_counted = set()
-            late_late_counted = set()
-            sat_late_late_counted = set()
-            sat_morning_counted = set()
+        dbg("   filled days_per_week default = 5")
 
-            for row in schedule_sheet.iter_rows(min_row=3, min_col=3):
-                row_number = row[0].row
-                for cell in row:
-                    name = schedule_sheet.cell(row=row_number, column=2).value
-                    date_col = cell.column
-                    date = schedule_sheet.cell(row=1, column=date_col).value
+    # strip & lower the names so matching always works
+    if "name" in df.columns:
+        df["name"] = df["name"].astype(str).str.strip().str.lower()
+        dbg("   normalized names")
+    else:
+        dbg("   warning: no \"name\" column found after renaming")
 
-                    if isinstance(cell.value, str):
-                        raw_shift = cell.value.strip()
-                        shift_start = raw_shift.split(":")[0] if ":" in raw_shift else raw_shift.upper()
-                    else:
-                        shift_start = cell.value
-
-                    if shift_start not in known_shifts and classify_shift(shift_start) is None:
-                        unrecognized_cells.append({
-                            "name": name,
-                            "date": date,
-                            "value": shift_start
-                        })
-                        continue
-
-                    if shift_start in ["13", "15", "9"]:
-
-                        last_week = date.strftime("%Y-W%U")
-
-                        if classify_shift(shift_start) == "early_late":
-                            if date.weekday() != 5:
-                                if (name, last_week) not in early_late_counted:
-                                    mask = df_history["name"] == name
-                                    df_history.loc[mask, "count_early_late"] += 1
-                                    if df_history.loc[mask, "latest_early_late"].values[0] is None or df_history.loc[mask, "latest_early_late"].values[0] < date:
-                                        df_history.loc[mask, "latest_early_late"] = last_week
-                                    early_late_counted.add((name, last_week))
-                            elif date.weekday() == 6:
-                                if (name, last_week) not in sat_early_late_counted:
-                                    mask = df_history["name"] == name
-                                    df_history.loc[mask, "count_saturday_early_late"] += 1
-                                    if df_history.loc[mask, "latest_saturday_early_late"].values[0] is None or df_history.loc[mask, "latest_saturday_early_late"].values[0] < date:
-                                        df_history.loc[mask, "latest_saturday_early_late"] = last_week
-                                    sat_early_late_counted.add((name, last_week))
-
-                        if classify_shift(shift_start) == "late_late":
-                            if date.weekday() != 5:
-                                if (name, last_week) not in late_late_counted:
-                                    mask = df_history["name"] == name
-                                    df_history.loc[mask, "count_late_late"] += 1
-                                    df_history.loc[mask, "count_early_late"] += 1
-                                    if df_history.loc[mask, "latest_early_late"].values[0] is None or df_history.loc[mask, "latest_early_late"].values[0] < date:
-                                        df_history.loc[mask, "latest_early_late"] = last_week
-                                    if df_history.loc[mask, "latest_late_late"].values[0] is None or df_history.loc[mask, "latest_late_late"].values[0] < date:
-                                        df_history.loc[mask, "latest_late_late"] = last_week
-                                    late_late_counted.add((name, last_week))
-                            elif date.weekday() == 6:
-                                if (name, last_week) not in sat_late_late_counted:
-                                    mask = df_history["name"] == name
-                                    df_history.loc[mask, "count_saturday_late_late"] += 1
-                                    df_history.loc[mask, "count_saturday_early_late"] += 1
-                                    if df_history.loc[mask, "latest_saturday_early_late"].values[0] is None or df_history.loc[mask, "latest_saturday_early_late"].values[0] < date:
-                                        df_history.loc[mask, "latest_saturday_early_late"] = last_week
-                                    if df_history.loc[mask, "latest_saturday_late_late"].values[0] is None or df_history.loc[mask, "latest_saturday_late_late"].values[0] < date:
-                                        df_history.loc[mask, "latest_saturday_late_late"] = last_week
-                                    sat_late_late_counted.add((name, last_week))
-
-                        if classify_shift(shift_start) == "morning" and date.weekday() == 6:
-                            if (name, last_week) not in sat_morning_counted:
-                                mask = df_history["name"] == name
-                                df_history.loc[mask, "count_saturday_morning"] += 1
-                                if df_history.loc[mask, "latest_saturday_morning"].values[0] is None or df_history.loc[mask, "latest_saturday_morning"].values[0] < date:
-                                    df_history.loc[mask, "latest_saturday_morning"] = last_week
-                                sat_morning_counted.add((name, last_week))
-
-            return df_history, unrecognized_cells, schedule_sheet
-
-        except Exception as e:
-            print(f"Error loading employee list: {e}")
-            return None, [], None
-
-    except Exception as e:
-        print(f"Error {e}: No History tab in the source document, creating new History tab")
+    # ─── 3) Grab the latest schedule sheet to return ──────────────────────
+    wb = openpyxl.load_workbook(file_path, data_only=True)
+    sheet_dates = []
+    for name in wb.sheetnames:
         try:
-            df_history = pd.read_excel(file_path, sheet_name="Team", usecols="B:L")
-            df_history.columns = df_history.columns.str.strip().str.lower()
-            df_history = df_history.rename(columns={
-                "agent's name": "name",
-                "team": "team",
-                "trained social": "trained_social",
-                "tier 3 trained": "t3_trained",
-                "days per week": "days_per_week"
-            })
-            df_history = df_history.dropna(how="all")
+            dt = parse(name)
+            sheet_dates.append((name, dt))
+        except:
+            pass
+    if not sheet_dates:
+        raise RuntimeError("No date-formatted sheets found to pick latest schedule from")
+    sheet_dates.sort(key=lambda x: x[1])
+    latest_name = sheet_dates[-1][0]
+    schedule_sheet = wb[latest_name]
+    dbg(f"✅ Using latest schedule tab: \"{latest_name}\"")
 
-            for col in [
-                "latest_early_late", "latest_late_late",
-                "latest_saturday_morning", "latest_saturday_early_late", "latest_saturday_late_late"
-            ]:
-                df_history[col] = None
-
-            for col in [
-                "count_early_late", "count_late_late",
-                "count_saturday_morning", "count_saturday_early_late", "count_saturday_late_late"
-            ]:
-                df_history[col] = 0
-
-            df_history["days_per_week"] = df_history["days_per_week"].astype(int)
-
-            wb_history = openpyxl.load_workbook(file_path)
-            sheet_dates = []
-            for sheet_name in wb_history.sheetnames:
-                try:
-                    parsed = parse(sheet_name)
-                    sheet_dates.append((sheet_name, parsed))
-                except:
-                    continue
-            sorted_sheets = sorted(sheet_dates, key=lambda x: x[1])
-            latest_sheet_name = sorted_sheets[-1][0]
-            schedule_sheet = wb_history[latest_sheet_name]
-
-            early_late_counted = set()
-            sat_early_late_counted = set()
-            late_late_counted = set()
-            sat_late_late_counted = set()
-            sat_morning_counted = set()
-
-            for row in schedule_sheet.iter_rows(min_row=3, min_col=3):
-                row_number = row[0].row
-                for cell in row:
-                    name = schedule_sheet.cell(row=row_number, column=2).value
-                    date_col = cell.column
-                    date = schedule_sheet.cell(row=1, column=date_col).value
-
-                    if isinstance(cell.value, str):
-                        raw_shift = cell.value.strip()
-                        shift_start = raw_shift.split(":")[0] if ":" in raw_shift else raw_shift.upper()
-                    else:
-                        shift_start = cell.value
-
-                    if shift_start not in known_shifts and classify_shift(shift_start) is None:
-                        unrecognized_cells.append({
-                            "name": name,
-                            "date": date,
-                            "value": shift_start
-                        })
-                        continue
-
-                    if shift_start in ["13", "15", "9"]:
-
-                        last_week = date.strftime("%Y-W%U")
-
-                        if classify_shift(shift_start) == "early_late":
-                            if date.weekday() != 5:
-                                if (name, last_week) not in early_late_counted:
-                                    mask = df_history["name"] == name
-                                    df_history.loc[mask, "count_early_late"] += 1
-                                    if df_history.loc[mask, "latest_early_late"].values[0] is None or df_history.loc[mask, "latest_early_late"].values[0] < date:
-                                        df_history.loc[mask, "latest_early_late"] = last_week
-                                    early_late_counted.add((name, last_week))
-                            elif date.weekday() == 6:
-                                if (name, last_week) not in sat_early_late_counted:
-                                    mask = df_history["name"] == name
-                                    df_history.loc[mask, "count_saturday_early_late"] += 1
-                                    if df_history.loc[mask, "latest_saturday_early_late"].values[0] is None or df_history.loc[mask, "latest_saturday_early_late"].values[0] < date:
-                                        df_history.loc[mask, "latest_saturday_early_late"] = last_week
-                                    sat_early_late_counted.add((name, last_week))
-
-                        if classify_shift(shift_start) == "late_late":
-                            if date.weekday() != 5:
-                                if (name, last_week) not in late_late_counted:
-                                    mask = df_history["name"] == name
-                                    df_history.loc[mask, "count_late_late"] += 1
-                                    df_history.loc[mask, "count_early_late"] += 1
-                                    if df_history.loc[mask, "latest_early_late"].values[0] is None or df_history.loc[mask, "latest_early_late"].values[0] < date:
-                                        df_history.loc[mask, "latest_early_late"] = last_week
-                                    if df_history.loc[mask, "latest_late_late"].values[0] is None or df_history.loc[mask, "latest_late_late"].values[0] < date:
-                                        df_history.loc[mask, "latest_late_late"] = last_week
-                                    late_late_counted.add((name, last_week))
-                            elif date.weekday() == 6:
-                                if (name, last_week) not in sat_late_late_counted:
-                                    mask = df_history["name"] == name
-                                    df_history.loc[mask, "count_saturday_late_late"] += 1
-                                    df_history.loc[mask, "count_saturday_early_late"] += 1
-                                    if df_history.loc[mask, "latest_saturday_early_late"].values[0] is None or df_history.loc[mask, "latest_saturday_early_late"].values[0] < date:
-                                        df_history.loc[mask, "latest_saturday_early_late"] = last_week
-                                    if df_history.loc[mask, "latest_saturday_late_late"].values[0] is None or df_history.loc[mask, "latest_saturday_late_late"].values[0] < date:
-                                        df_history.loc[mask, "latest_saturday_late_late"] = last_week
-                                    sat_late_late_counted.add((name, last_week))
-
-                        if classify_shift(shift_start) == "morning" and date.weekday() == 6:
-                            if (name, last_week) not in sat_morning_counted:
-                                mask = df_history["name"] == name
-                                df_history.loc[mask, "count_saturday_morning"] += 1
-                                if df_history.loc[mask, "latest_saturday_morning"].values[0] is None or df_history.loc[mask, "latest_saturday_morning"].values[0] < date:
-                                    df_history.loc[mask, "latest_saturday_morning"] = last_week
-                                sat_morning_counted.add((name, last_week))
-
-            return df_history, {}, unrecognized_cells, schedule_sheet
-
-        except Exception as e:
-            print(f"Error loading employee list: {e}")
-            return None, {}, [], None
+    # ─── 4) Done! ────────────────────────────────────────────────────────
+    dbg(f"   🎯 load_employee_history complete, returning df({df.shape}), "
+          f"cells({len(unrecognized_cells)}), sheet({latest_name})")
+    return df, unrecognized_cells, schedule_sheet
 
 def check_mismatches(excel_file_path, df_history, schedule_sheet, df_team):
     """
@@ -1403,11 +1234,10 @@ def check_mismatches(excel_file_path, df_history, schedule_sheet, df_team):
     ]
 
     # Finding the base schedule names
-    for row in base_schedule_sheet.iterrows():
+    for idx, row in base_schedule_sheet.iterrows():
         for cell in row:
-            name = cell
-            if name:
-                base_schedule_names.append(name.strip().lower())
+            if cell:
+                base_schedule_names.append(str(cell).strip().lower())
 
     leavers = set(previous_schedule_names) - set(team_names)
     new_hires = set(team_names) - set(previous_schedule_names)
@@ -1431,7 +1261,12 @@ def check_mismatches(excel_file_path, df_history, schedule_sheet, df_team):
 
     return mismatches
 
+
 def fill_schedule(df_team, df_schedule, destination_file_path, sheet_name):
+    print(f"📂 Filling schedule into: {destination_file_path}")
+    print("📋 Sheet name:", sheet_name)
+    print("📊 df_schedule shape:", df_schedule.shape)
+    print("👥 df_schedule Employees:", df_schedule['Employee'].unique())
     wb = openpyxl.load_workbook(destination_file_path)
     sheet = wb[sheet_name]
     staff_list = df_team["name"].tolist()
@@ -1441,14 +1276,21 @@ def fill_schedule(df_team, df_schedule, destination_file_path, sheet_name):
         agent_row = df_team[df_team["name"] == staff]
 
         if agent_row.empty:
+            print(f"⚠️ No schedule for: {staff}")
             continue  # skip if agent is not found
 
         hours_per_week = agent_row["hours_per_week"].values[0]
         days_per_week = agent_row["days_per_week"].values[0]
 
+        row_to_fill = None
         for row in sheet.iter_rows(min_row=3, max_col=2):
             if row[1].value == staff:
                 row_to_fill = row[1].row
+                break
+
+        if row_to_fill is None:
+            print(f"⚠️ Could not find row for: {staff}")
+            continue
 
         for col in range(3, sheet.max_column + 1):
             cell = sheet.cell(row=1, column=col)
@@ -1482,19 +1324,21 @@ def fill_schedule(df_team, df_schedule, destination_file_path, sheet_name):
                         sheet.cell(row=row_to_fill, column=col).value = shift_str
                     else:
                         sheet.cell(row=row_to_fill, column=col).value = shift
+    print("✅ Writing file to:", destination_file_path)
+    print("✅ Schedule preview:\n", df_schedule.head(10))
 
     wb.save(destination_file_path)
 
 def fill_history_tab(df_history, excel_file_path, sheet_name="History", all_months=False):
-    """
-    Update the Excel History sheet based on past schedule tabs.
-    By default, processes only the most recent past month;
-    if all_months=True, backfills through every past month tab.
-    """
+    print("📥 fill_history_tab called with:", excel_file_path)
+    try:
+        wb = openpyxl.load_workbook(excel_file_path, data_only=True)
+        print("   ✅ workbook loaded, sheets:", wb.sheetnames)
+    except Exception as e:
+        print("   ❌ fill_history_tab: cannot open workbook:", e)
+        raise
 
-    wb = openpyxl.load_workbook(excel_file_path)
-    print("🔨 Running fill_history_tab on", excel_file_path)
-
+    dbg("   sheets found:", wb.sheetnames)
     # 1) Parse every “Month YYYY” tab
     parsed_tabs = []
     today = datetime.today().replace(day=1)
@@ -1549,6 +1393,7 @@ def fill_history_tab(df_history, excel_file_path, sheet_name="History", all_mont
         assert header in col_indices, f"Missing History header: {header}"
 
     # 7) Process each selected tab
+    dbg("   processing History tab rows …")
     for tab in tabs_to_process:
         print(f"Checking tab: {tab}")
         schedule_sheet = wb[tab]
@@ -1629,7 +1474,10 @@ def fill_history_tab(df_history, excel_file_path, sheet_name="History", all_mont
     # 8) Save all updates back to the workbook
     print("✅ History updated and saved to", excel_file_path)
 
+    # at very end of fill_history_tab
     wb.save(excel_file_path)
+    print(f"✅ fill_history_tab: saved History into {excel_file_path!r}")
+
 
 def print_avg_days_worked(df_schedule):
     temp = df_schedule.copy()
@@ -1644,109 +1492,83 @@ def print_avg_days_worked(df_schedule):
     )
     print("\n📊 Average Days Worked Per Week:")
     print(avg_days.round(2))
+import os
+import shutil
 
-def run_schedule(excel_file_path, output_folder):
-    # ---------------------------
-    # 📁 1. File setup
-    # ---------------------------
-    destination_file_path = os.path.join(output_folder, "Team_updated.xlsx")
+def run_schedule(uploaded_path, output_folder):
+    # 1️⃣ Make a working copy right away
+    os.makedirs(output_folder, exist_ok=True)
+    dest = os.path.join(output_folder, "Team_updated.xlsx")
+    shutil.copy(uploaded_path, dest)
+    excel = dest
+    print("🔨 Working copy is:", excel)
+    # 2️⃣ Now load EVERYTHING from the copy
+    shift_requirements = load_shift_requirements(excel, sheet_name="Shifts")
 
-    # ✅ Use the uploaded file as input
-    shift_requirements = load_shift_requirements(excel_file_path, sheet_name="Shifts")
+    df_team   = load_employee_list(excel)
+    df_history, _, schedule_sheet = load_employee_history(excel)
 
-    print("📊 shift_requirements.columns:", shift_requirements.columns)
-    print("📊 shift_requirements index type:", shift_requirements.index.dtype)
-    print(shift_requirements.head())
+    # 3️⃣ Update that copy’s History tab
+    print("📥 run_schedule: about to call fill_history_tab…")
+    fill_history_tab(df_history, excel)
+    print("   🔍 Checking History[2,3]…", end=" ")
 
+    wb2 = openpyxl.load_workbook(excel, data_only=True)
+    val = wb2["History"].cell(row=2, column=3).value
+    print(repr(val))
 
-    # ---------------------------
-    # 🧑‍💼 2. Load employee list
-    # ---------------------------
-    employee_list = load_employee_list(excel_file_path)
-    df_team = employee_list.copy()
-    print("🔍 df_team columns:", df_team.columns.tolist())
-    print("🧾 df_team head:")
-    print(df_team[["name", "trained_social"]].head(10))
-    print("✅ trained_social value counts:")
-    print(df_team["trained_social"].value_counts(dropna=False))
+    # 4️⃣ Re-load history/sheet from the same copy to pick up your writes
+    df_history, unrec_cells, schedule_sheet = load_employee_history(excel)
 
-    # ---------------------------
-    # 10. Update the team history
-    # ---------------------------
-    df_history, unrecognized_cells, schedule_sheet = load_employee_history(excel_file_path)
-    fill_history_tab(df_history, excel_file_path)
-    df_history, _, _ = load_employee_history(excel_file_path)
+    # 5️⃣ Compute mismatches against that now-up-to-date copy
+    mismatches = check_mismatches(excel,
+                                  df_history,
+                                  schedule_sheet,
+                                  df_team)
+    print("✅ run_schedule: mismatches =", mismatches)
 
-    mismatches = check_mismatches(excel_file_path, df_history, schedule_sheet, df_team)
+    # 6️⃣ Append a new month tab to the copy
+    sheet_name, start_date, end_date, full_date_range = output_schedule(
+        excel,  # source for base & prev-month
+        excel   # and also target for saving
+    )
 
-    # ---------------------------
-    # 🗓️ 3. Create empty schedule
-    # ---------------------------
-    sheet_name, start_date, end_date,  full_date_range = output_schedule(excel_file_path, destination_file_path) #excel file being created
+    # 7️⃣ Build your DataFrame and merge
     df_schedule = create_schedule_structure(
         df_holidays=None,
-        employee_list=employee_list["name"].tolist(),
+        employee_list=df_team["name"].tolist(),
         start_date=start_date,
         end_date=end_date
     )
-
-    # 3.5 extract SMT staff
-    smt_team, grouped_smt_team = extract_smt_staff_grouped(excel_file_path)
-    smt_team["shift_time"] = None
-
-    # ---------------------------
-    # 🌐 4. Group employees by language
-    # ---------------------------
-    language_groups = group_employees_by_language(excel_file_path)
-    #print(df_schedule.columns)
     df_schedule = merge_df_team_and_df_schedule(df_team, df_schedule)
+    df_schedule = assign_initial_shifts(df_schedule)
 
-    # 10. Load and process the holiday calendar
-    # ---------------------------
-    df_holidays = load_holiday_calendar(excel_file_path, sheet_name="Holidays")
+    # 8️⃣ Integrate holidays, assign shifts, etc...
+    df_holidays      = load_holiday_calendar(excel, sheet_name="Holidays")
     df_holidays_long = process_holiday_calendar(df_holidays)
     if df_holidays_long is not None:
         df_schedule = integrate_holidays_into_schedule(df_schedule, df_holidays_long)
-    else:
-        print("⚠ Skipping holiday integration—no valid holiday data loaded.")
-    # ---------------------------
-    # ⏰ 5. Assign everyone 9:00 shifts
-    # ---------------------------
-    df_schedule = assign_initial_shifts(df_schedule)
-    grouped_all_team = df_team.groupby("team")["name"].apply(list).to_dict()
 
-    duplicates = df_schedule.duplicated(subset=["Employee", "Day"], keep=False)
-    print(df_schedule[duplicates])
-    print("here is the latest debug line")
+    _, grouped_smt_team = extract_smt_staff_grouped(excel)
+    df_history, df_schedule = apply_weekly_shift_logic(
+        df_schedule, df_team, grouped_smt_team, shift_requirements, df_history
+    )
+    # … plus your other assignment passes …
 
-    # ---------------------------
-    # 🌙 7. Assign late shift teams
-    # ---------------------------
-    df_history, df_schedule = apply_weekly_shift_logic(df_schedule, df_team, grouped_smt_team, shift_requirements, df_history)
+    print("🧪 df_schedule columns:", df_schedule.columns.tolist())
+    print(df_history[["name", "count_saturday_late_late", "count_saturday_early_late"]].sort_values(
+        by="count_saturday_late_late", ascending=False))
 
-    # ---------------------------
-    #8 reporting
-    # ---------------------------
-    smt_check(df_schedule, df_team)
-    report_smt_coverage(df_schedule, df_team)
-    print_avg_days_worked(df_schedule)
+    # 9️⃣ Finally fill that new sheet in the SAME copy
+    fill_schedule(df_team, df_schedule, excel, sheet_name)
 
-    # ---------------------------
-    #output to the excel file
-    # ---------------------------
-    print("📊 Total schedule rows:", df_schedule.shape[0])
-    print("📆 June rows:", df_schedule[df_schedule['Day'].dt.month == 6].shape[0])
-
-    fill_schedule(df_team, df_schedule, destination_file_path, sheet_name)
-
-
-
-    return sheet_name, start_date, end_date, full_date_range, name_mismatches, unrecognized_cells
+    # 🔟 Return everything
+    return sheet_name, start_date, end_date, full_date_range, mismatches, unrec_cells, dest
 
 if __name__ == "__main__":
 
-    sheet_name, start_date, end_date, full_date_range, name_mismatches, unrecognized_cells = run_schedule(
-        "/home/julien/Documents/PycharmProjects/PythonschedulingNEW/Team Rota 2024-2025 - Team.xlsx",
-        "/home/julien/Documents/PycharmProjects/PythonschedulingNEW"
+    sheet_name, start_date, end_date, full_date_range, mismatches, unrecognized_cells, output = run_schedule(
+        "/home/julien/Documents/source_file.xlsx",
+        "/home/julien/Documents/"
     )
     print(f"✅ File saved to: {output}")
