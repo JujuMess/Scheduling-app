@@ -6,6 +6,7 @@ from openpyxl.styles import Font
 from openpyxl.styles import PatternFill
 import pandas as pd
 import random
+import numpy as np
 import calendar
 from datetime import datetime, date, timedelta
 from dateutil.parser import parse
@@ -59,6 +60,14 @@ def process_holiday_calendar(df_hol):
         df_long["on_leave"] = df_long["Status"] == "OFF" # replace OFF wit True
         df_long = df_long.drop(columns=["Status"])
         df_long = df_long.reset_index().rename(columns={"index":"Date"}) #make date a normal column
+        df_long["Employee"] = (
+            df_long["Employee"].astype(str)
+            .str.replace("\u00A0", " ", regex=False)
+            .str.strip()
+            .str.replace(r"\*$", "", regex=True)
+            .str.lower()
+        )
+
         print(df_long.head())
         return df_long
     except Exception as e:
@@ -75,11 +84,22 @@ def integrate_holidays_into_schedule(df_schedule, df_long):
     df_schedule = df_schedule.drop(columns=["on_leave"])
     return df_schedule
 
+def _norm_name_list(names):
+    return [str(n).strip().replace("*","").lower() for n in names if pd.notna(n)]
+
+
 #creating the schedule structure to be called before integrate holiday
 def create_schedule_structure(df_holidays, employee_list, start_date, end_date):
     date_range = pd.date_range(start=start_date, end=end_date) #generate all dates beween the start and end dates
 
     df_schedule = pd.DataFrame([(day, emp) for day in date_range for emp in employee_list],columns=["Day", "Employee"]) #new table merging both date and employees
+    df_schedule["Employee"] = (
+        df_schedule["Employee"].astype(str)
+        .str.strip()
+        .str.replace(r"\*$", "", regex=True)
+        .str.lower()
+    )
+
     df_schedule["shift_time"] = None #add a column to the df_schedule variable
     return df_schedule
 
@@ -108,6 +128,16 @@ def load_employee_list(file_path):
             "hours per week": "hours_per_week",
         })
 
+        df_team["norm_name"] = (
+            df_team["name"].astype(str)
+            .str.replace("\u00A0", " ", regex=False)  # NBSP → space
+            .str.strip()
+            .str.replace(r"\*$", "", regex=True)  # drop trailing *
+            .str.lower()
+        )
+
+        name_map = dict(zip(df_team["norm_name"], df_team["name"]))
+
         # ─── Normalize the TRUE/FALSE strings into real booleans ───
         df_team["trained_social"] = (
             df_team["trained_social"]
@@ -121,7 +151,7 @@ def load_employee_list(file_path):
         print("✅ trained_social value counts:", df_team["trained_social"].value_counts())
 
         df_team = df_team.dropna(how="all")  # Remove empty rows if any
-        return df_team
+        return df_team, name_map
     except Exception as e:
         print(f"Error loading employee list: {e}")
         return None
@@ -200,224 +230,275 @@ def assign_initial_shifts(df_schedule):
 
     return df_schedule
 
-def select_fairest(df_history, df_team, candidates, shift_type, top_n=10, required_count=None, filter_func=None, duplicate_teams=True):
-    # 🔒 Make sure candidates is a list of names
-    if isinstance(candidates, pd.DataFrame):
-        if "name" in candidates.columns:
-            candidates = candidates["name"].tolist()
-        else:
-            raise ValueError("DataFrame passed as 'candidates' must contain a 'name' column.")
-    elif not isinstance(candidates, list):
-        candidates = list(candidates)
-    # start with just the names
-    candidates_df = pd.DataFrame({"name": candidates})
-    candidates_df = candidates_df.dropna(subset=["name"])
-    candidates_df = candidates_df.merge(df_team[["name", "team", "trained_social"]], on="name", how="left")
-    candidates_df["name"] = candidates_df["name"].astype(str)
+# at top of file
+import numpy as np
 
-    # now your filter_func can see a 'team' column
-    if filter_func:
-        mask = candidates_df.apply(filter_func, axis=1).astype(bool)
-        candidates_df = candidates_df.loc[mask]
+def update_history(df_history, df_week, **kwargs):
+    """
+    kwargs can include any of:
+      - weekday_late_late, weekday_early_late
+      - saturday_late_late, saturday_early_late, saturday_morning
+    Each value should be a list[str] of employee names.
+    """
 
-    merged = candidates_df.merge(df_history.drop(columns=["team"], errors="ignore"), on="name", how="left")
-    merged[f"latest_{shift_type}"] = pd.to_datetime(merged[f"latest_{shift_type}"], errors="coerce")
-    merged[f"latest_{shift_type}"] = merged[f"latest_{shift_type}"].fillna(pd.Timestamp("1900-01-01"))
+    # Map shift keys → (latest_column, count_column)
+    key_map = {
+        "weekday_late_late":    ("latest_late_late",            "count_late_late"),
+        "weekday_early_late":   ("latest_early_late",           "count_early_late"),
+        "saturday_morning":     ("latest_saturday_morning",     "count_saturday_morning"),
+        "saturday_early_late":  ("latest_saturday_early_late",  "count_saturday_early_late"),
+        "saturday_late_late":   ("latest_saturday_late_late",   "count_saturday_late_late"),
+    }
+    week_anchor = pd.to_datetime(df_week["Day"].max()) if not df_week.empty else pd.NaT
 
-    # fallback if there are no candidates left after filtering
-    if merged.empty:
-        print("❌ No candidates available after filtering.")
-        return pd.DataFrame({"name": []})
+    # Ensure dtypes are friendly
+    for _, (latest_col, count_col) in key_map.items():
+        if latest_col in df_history.columns:
+            df_history[latest_col] = pd.to_datetime(df_history[latest_col], errors="coerce")
+        if count_col in df_history.columns:
+            df_history[count_col] = pd.to_numeric(df_history[count_col], errors="coerce").fillna(0).astype(int)
 
-    short = (
-        merged
-        .sort_values([f"count_{shift_type}", f"latest_{shift_type}"], ascending=[True, False])
-        .head(top_n)
-    )
+    # For each provided key, update counts and latest
+    for key, names in kwargs.items():
+        if key not in key_map:
+            continue
+        latest_col, count_col = key_map[key]
+        name_list = _to_name_list(names)
+        if not name_list:
+            continue
 
-    if not duplicate_teams:
-        short = short.drop_duplicates(subset=["team"], keep="first")
+        for name in name_list:
+            # increment count
+            row_mask = (df_history["name"].astype(str).str.strip().str.lower()
+                        == str(name).strip().lower())
+            if not row_mask.any():
+                continue  # name not in history table
 
-    if not duplicate_teams and len(short) < required_count:
-            print(f"⚠ Not enough unique teams found for {shift_type} (got {len(short)}, need {required_count})")
+            df_history.loc[row_mask, count_col] = df_history.loc[row_mask, count_col].fillna(0).astype(int) + 1
 
-    if required_count is not None:
-        # Keep expanding top_n until we get enough people or reach all available
-        while short.shape[0] < required_count:
-            if top_n >= merged.shape[0]:
-                print(f"⚠ Only {short.shape[0]} candidates available, but {required_count} required.")
-                break  # prevent infinite loop
-            top_n += 1
-            short = (
-                merged
-                .sort_values([f"count_{shift_type}", f"latest_{shift_type}"], ascending=[True, False])
-                .head(top_n)
-            )
+            # latest = max day in the currently assigned week for that person
+            # (no need to re-classify shifts)
+            latest_day = df_week.loc[
+                df_week["Employee"].astype(str).str.strip().str.lower()
+                == str(name).strip().lower(), "Day"
+            ].max()
 
-            print(f"🔁 {short.shape[0]} candidates selected for {shift_type}, aiming for {required_count}")
-
-        short = short.head(required_count)
-
-    return short.sample(frac=1).reset_index(drop=True)
-
-def update_history(df_history, df_week,weekday_late_late=None, weekday_early_late=None, saturday_late_late=None, saturday_early_late=None, saturday_morning=None):
-
-    if weekday_late_late:
-        for name in weekday_late_late:
-            df_history.loc[df_history["name"] == name, "count_late_late"] += 1
-            mask = (df_week["Employee"] == name) & (df_week["shift_time"].apply(classify_shift) == "late_late")
-            latest_day = df_week.loc[mask, "Day"].max()
-            if pd.notna(latest_day):
-                df_history.loc[df_history["name"] == name, "latest_late_late"] = latest_day.strftime("%Y-W%U")
-
-    if weekday_early_late:
-        for name in weekday_early_late:
-            df_history.loc[df_history["name"] == name, "count_early_late"] += 1
-            mask = (df_week["Employee"] == name) & (df_week["shift_time"].apply(classify_shift) == "early_late")
-            latest_day = df_week.loc[mask, "Day"].max()
-            if pd.notna(latest_day):
-                df_history.loc[df_history["name"] == name, "latest_early_late"] = latest_day.strftime("%Y-W%U")
-
-    if saturday_late_late:
-        for name in saturday_late_late:
-            df_history.loc[df_history["name"] == name, "count_saturday_late_late"] += 1
-            mask = (
-                    (df_week["Employee"] == name) &
-                    (df_week["shift_time"].apply(classify_shift) == "late_late") &
-                    (df_week["Day"].dt.weekday == 5)
-            )
-
-            latest_day = df_week.loc[mask, "Day"].max()
+            # Fallback to the week’s last day if no specific match was found
+            if pd.isna(latest_day):
+                latest_day = week_anchor
 
             if pd.notna(latest_day):
-                df_history.loc[df_history["name"] == name, "latest_saturday_late_late"] = latest_day.strftime("%Y-W%U")
+                df_history.loc[row_mask, latest_col] = pd.to_datetime(latest_day)
 
-    if saturday_early_late:
-        for name in saturday_early_late:
-            df_history.loc[df_history["name"] == name, "count_saturday_early_late"] += 1
-            mask = (
-                    (df_week["Employee"] == name) &
-                    (df_week["shift_time"].apply(classify_shift) == "early_late") &
-                    (df_week["Day"].dt.weekday == 5)
-            )
-
-            latest_day = df_week.loc[mask, "Day"].max()
-
-            if pd.notna(latest_day):
-                df_history.loc[df_history["name"] == name, "latest_saturday_early_late"] = latest_day.strftime("%Y-W%U")
-
-    if saturday_morning is not None and not saturday_morning.empty:
-        for name in saturday_morning:
-            df_history.loc[df_history["name"] == name, "count_saturday_morning"] += 1
-            mask = (
-                    (df_week["Employee"] == name) &
-                    (df_week["shift_time"].apply(classify_shift) == "morning") &
-                    (df_week["Day"].dt.weekday == 5)
-            )
-
-            latest_day = df_week.loc[mask, "Day"].max()
-
-            if pd.notna(latest_day):
-                df_history.loc[df_history["name"] == name, "latest_saturday_morning"] = latest_day.strftime("%Y-W%U")
+            df_history.loc[row_mask, latest_col] = pd.to_datetime(latest_day)
 
     return df_history
-# Revised assign_both_late_shifts: pre‐select SMT to cover both early_late & late_late,
-# then fill any remaining slots with non‐SMT to meet overall headcount.
-def assign_both_late_shifts(df_week, df_history, df_team, grouped_smt_team, shift_requirements):
-    week = df_week["Day"].dt.isocalendar().week.iloc[0]
-    used_languages = set()
 
-    # SMT requirements per shift
-    smt_req_13 = int(shift_requirements.loc["13", "smt_needed"])
-    smt_req_15 = int(shift_requirements.loc["15", "smt_needed"])
-    total_smt_req = smt_req_13 + smt_req_15
+def select_fairest(candidates, df_history, df_team,
+                   shift_type, k=1,
+                   week_start=None, cooldown_days=6,
+                   filter_func=None, duplicate_teams=True):
+    """
+    Return a list of k norm_names chosen fairly for `shift_type`.
+    Uses counts + latest from df_history, optional filter_func, and a week-based RNG tie-breaker.
+    """
+    import pandas as pd
+    import numpy as np
 
-    # Build SMT pool and select SMTs
-    smt_pool = df_team[df_team["trained_social"]]["name"].tolist()
-    smt_selected = select_fairest(
-        df_history,
-        df_team,
-        smt_pool,
-        shift_type="late_late",
-        top_n=len(smt_pool),
-        required_count=total_smt_req,
-        duplicate_teams=False
+    # --- Normalize candidate names to match df_team.norm_name ---
+    cand = (pd.Series(candidates, dtype="object")
+              .dropna()
+              .astype(str)
+              .str.replace("\u00A0", " ", regex=False)
+              .str.strip()
+              .str.replace(r"\*$", "", regex=True)
+              .str.lower())
+    candidates_df = pd.DataFrame({"name": cand.unique()})
+
+    # --- Merge team metadata on normalized key ---
+    candidates_df = candidates_df.merge(
+        df_team[["norm_name", "team", "trained_social"]],
+        left_on="name", right_on="norm_name", how="left"
     )
-    smt_selected = smt_selected["name"].tolist()
 
-    # Assign SMTs to late_late then early_late
-    late_late_team = smt_selected[:smt_req_15]
-    early_late_team = smt_selected[smt_req_15:]
+    # --- Optional external filter (row-wise) ---
+    if filter_func is not None and len(candidates_df):
+        mask = candidates_df.apply(filter_func, axis=1).astype(bool)
+        candidates_df = candidates_df[mask]
 
-    # Record used languages
-    for name in smt_selected:
-        lang = df_team.loc[df_team["name"] == name, "team"].iloc[0]
-        used_languages.add(lang)
+    # --- Weekly cooldown: build a mask ALIGNED TO df_history.index (no set_index here) ---
+    latest_col = f"latest_{shift_type}"
+    if week_start is not None and latest_col in df_history.columns and len(candidates_df):
+        s = df_history[latest_col]
 
-    # Headcounts required
+        # handle object cells that may contain arrays/lists
+        if s.dtype == "O":
+            s = s.apply(lambda x: (x[0] if isinstance(x, (list, tuple, np.ndarray)) else x))
+
+        s = pd.to_datetime(s, errors="coerce")
+        # normalize tz if present
+        try:
+            s = s.dt.tz_convert(None)
+        except Exception:
+            try:
+                s = s.dt.tz_localize(None)
+            except Exception:
+                pass
+
+        cutoff = pd.Timestamp(week_start).normalize() - pd.Timedelta(days=cooldown_days)
+        mask = s.ge(cutoff)   # NaT → False
+
+        # names to block (normalize like candidates)
+        recent_block = set(
+            df_history.loc[mask, "name"]
+            .astype(str)
+            .str.replace("\u00A0", " ", regex=False)
+            .str.strip()
+            .str.replace(r"\*$", "", regex=True)
+            .str.lower()
+        )
+        candidates_df = candidates_df[~candidates_df["name"].isin(recent_block)]
+
+    if not len(candidates_df):
+        return []
+
+    # --- Team duplication control (simple: max 1 per team when False) ---
+    if not duplicate_teams and "team" in candidates_df.columns:
+        candidates_df = candidates_df.drop_duplicates(subset=["team"])
+
+    # --- Fairness: min count, then oldest latest, then week-seeded random ---
+    hist = df_history.copy()
+    hist_idx = (hist["name"].astype(str)
+                          .str.replace("\u00A0", " ", regex=False)
+                          .str.strip()
+                          .str.replace(r"\*$", "", regex=True)
+                          .str.lower())
+    hist.index = hist_idx
+
+    cnt_col = f"count_{shift_type}"
+    if cnt_col in hist.columns:
+        counts = hist.reindex(candidates_df["name"])[cnt_col].fillna(0)
+        candidates_df = candidates_df.assign(_cnt=counts.values)
+        min_cnt = candidates_df["_cnt"].min()
+        tier = candidates_df[candidates_df["_cnt"] == min_cnt].copy()
+    else:
+        tier = candidates_df.copy()
+
+    latest_series = pd.to_datetime(
+        hist.reindex(tier["name"])[latest_col],
+        errors="coerce"
+    ).fillna(pd.Timestamp("1970-01-01"))
+    tier = tier.assign(_latest=latest_series.values)
+
+    # Oldest (earliest) latest date first; then sample to break remaining ties
+    tier = tier.sort_values("_latest", ascending=True)
+
+    n_pick = min(k, len(tier))
+    if n_pick <= 0:
+        return []
+
+    seed = int(pd.Timestamp(week_start).strftime("%Y%W")) if week_start is not None else None
+    picked = tier.sample(n=n_pick, random_state=seed)["name"].tolist()
+    return picked
+
+
+def assign_both_late_shifts(df_week, df_history, df_team, grouped_smt_team, shift_requirements):
+    """
+    Pick weekday SMTs for 15:00 (late_late) and 13:00 (early_late),
+    apply weekly cooldown using week_start,
+    then fill remaining headcount with non-SMT agents.
+    Returns: df_week, late_late_team (list), early_late_team (list)
+    """
+    import pandas as pd
+
+    # Week context for cooldown
+    week_start = pd.to_datetime(df_week["Day"].min()).normalize()
+
+    # Requirements
+    smt_req_13   = int(shift_requirements.loc["13", "smt_needed"])
+    smt_req_15   = int(shift_requirements.loc["15", "smt_needed"])
     headcount_13 = int(shift_requirements.loc["13", "min_required"])
     headcount_15 = int(shift_requirements.loc["15", "min_required"])
 
-    # Non-SMT candidates for filling
-    all_candidates = df_team["name"].tolist()
-    filler_pool = [n for n in all_candidates if n not in smt_selected]
+    # Pools (normalized names only)
+    smt_pool   = df_team.loc[df_team["trained_social"], "norm_name"].tolist()
+    all_people = df_team["norm_name"].tolist()
+    print("SMT pool size:", len(smt_pool))
 
-    # Fill remaining late_late slots
-    remaining_15 = headcount_15 - len(late_late_team)
-    if remaining_15 > 0:
-        if remaining_15 > len(filler_pool):
-            print(f"⚠ Not enough filler candidates for late_late (needed {remaining_15}, available {len(filler_pool)})")
-            remaining_15 = len(filler_pool)
+    # 1) Pick SMTs
+    late_late_team = select_fairest(
+        candidates=smt_pool,
+        df_history=df_history,
+        df_team=df_team,
+        shift_type="late_late",
+        k=smt_req_15,
+        week_start=week_start,
+        cooldown_days=6,
+        duplicate_teams=False
+    )
+
+    remaining_smt_pool = [n for n in smt_pool if n not in late_late_team]
+    early_late_team = select_fairest(
+        candidates=remaining_smt_pool,
+        df_history=df_history,
+        df_team=df_team,
+        shift_type="early_late",
+        k=smt_req_13,
+        week_start=week_start,
+        cooldown_days=6,
+        duplicate_teams=False
+    )
+
+    # 2) Fill remaining headcount with non-SMTs
+    need_15 = max(0, headcount_15 - len(late_late_team))
+    if need_15:
+        filler_pool = [n for n in all_people if n not in set(late_late_team) | set(early_late_team)]
         more_15 = select_fairest(
-            df_history,
-            df_team,
-            filler_pool,
+            candidates=filler_pool,
+            df_history=df_history,
+            df_team=df_team,
             shift_type="late_late",
-            top_n=len(filler_pool),
-            required_count=remaining_15,
-            filter_func=lambda r: r["team"] not in used_languages,
+            k=need_15,
+            week_start=week_start,
+            cooldown_days=6,
             duplicate_teams=False
         )
-        more_15 = more_15["name"].tolist()
         late_late_team += more_15
-        for name in more_15:
-            used_languages.add(df_team.loc[df_team["name"] == name, "team"].iloc[0])
 
-    # Fill remaining early_late slots
-    remaining_13 = headcount_13 - len(early_late_team)
-    if remaining_13 > 0:
-        if remaining_13 > len(filler_pool):
-            print(f"⚠ Not enough filler candidates for early_late (needed {remaining_13}, available {len(filler_pool)})")
-            remaining_13 = len(filler_pool)
+    need_13 = max(0, headcount_13 - len(early_late_team))
+    if need_13:
+        filler_pool = [n for n in all_people if n not in set(late_late_team) | set(early_late_team)]
         more_13 = select_fairest(
-            df_history,
-            df_team,
-            filler_pool,
+            candidates=filler_pool,
+            df_history=df_history,
+            df_team=df_team,
             shift_type="early_late",
-            top_n=len(filler_pool),
-            required_count=remaining_13,
-            filter_func=lambda r: r["team"] not in used_languages,
+            k=need_13,
+            week_start=week_start,
+            cooldown_days=6,
             duplicate_teams=False
         )
-        more_13 = more_13["name"].tolist()
         early_late_team += more_13
-        for name in more_13:
-            used_languages.add(df_team.loc[df_team["name"] == name, "team"].iloc[0])
 
-    # Assign agents into df_week
-    for name in late_late_team:
-        days = df_week[(df_week["Employee"] == name) & (df_week["Weekday"] < 5)]["Day"].tolist()
+    # 3) Write assignments for Mon–Fri
+    for nm in late_late_team:
+        days = df_week[(df_week["Employee"] == nm) & (df_week["Weekday"] < 5)]["Day"].tolist()
         for d in days:
-            assign_one_agent(df_week, d, "15", name)
+            assign_one_agent(df_week, d, "15", nm)
+    if "assigned_weekly_15" not in df_week.columns:
+        df_week["assigned_weekly_15"] = False
     df_week.loc[df_week["Employee"].isin(late_late_team), "assigned_weekly_15"] = True
 
-    for name in early_late_team:
-        days = df_week[(df_week["Employee"] == name) & (df_week["Weekday"] < 5)]["Day"].tolist()
+    for nm in early_late_team:
+        days = df_week[(df_week["Employee"] == nm) & (df_week["Weekday"] < 5)]["Day"].tolist()
         for d in days:
-            assign_one_agent(df_week, d, "13", name)
+            assign_one_agent(df_week, d, "13", nm)
+    if "assigned_weekly_13" not in df_week.columns:
+        df_week["assigned_weekly_13"] = False
     df_week.loc[df_week["Employee"].isin(early_late_team), "assigned_weekly_13"] = True
 
     return df_week, late_late_team, early_late_team
+
 
 def enforce_minimum_staffing(df_schedule, shift_requirements):
     """
@@ -509,7 +590,7 @@ def assign_needed_smt(df_schedule, day, shift, smt_needed, filter_func = None):
     else:
         print(f"⚠️ Language overlap detected — skipping SMT assignment for shift {shift} on {day}.")
     selected_lang
-    return df_schedule, selected_lang
+    return df_schedule
 
 def assign_one_agent(df_schedule, day, shift, agent):
     try:
@@ -552,7 +633,7 @@ def assign_saturday_shifts(df_week, df_history, df_team, grouped_smt_team, shift
 
     already_lated = set(already_lated)
     saturday_eligible = df_team.loc[
-        ~df_team["name"].isin(already_lated),
+        ~df_team["norm_name"].isin(already_lated),
         "name"
     ].tolist()
     print("📊 All SMT candidates available:")
@@ -568,17 +649,22 @@ def assign_saturday_shifts(df_week, df_history, df_team, grouped_smt_team, shift
         smt_requirement = shift_requirements.loc["15", "smt_needed"]
 
         raw_smt = df_team[df_team["trained_social"] == True]["name"].tolist()
+        raw_smt = _norm_name_list(df_team.loc[df_team["trained_social"], "name"].tolist())
+
+        print(df_history[df_history["name"].isin(raw_smt)][["name", "count_saturday_late_late"]])
+
         print("👀 SMTs available BEFORE fairness check:", raw_smt)
         print("🧾 Counts in df_history:")
         print(df_history[df_history["name"].isin(raw_smt)][["name", "count_saturday_late_late"]])
         fair_sat15 = select_fairest(
             df_history, df_team, saturday_eligible,
             shift_type="saturday_late_late",
-            top_n=top_n_saturday,
-            required_count=smt_requirement,
+            k=k,
             filter_func=lambda row: row["team"] not in used_languages_late and row["trained_social"],
-            duplicate_teams=False
+            duplicate_teams=False,
+            cooldown_days=6
         )
+
         print("✅ SMTs selected for fairness (Sat 15):", fair_sat15["name"].tolist())
 
         if fair_sat15.empty:
@@ -586,7 +672,7 @@ def assign_saturday_shifts(df_week, df_history, df_team, grouped_smt_team, shift
             print("🔁 RETURNING EMPTY LISTS")
             return df_week, [], []
         name = fair_sat15["name"].iloc[0]
-        lang = df_team.loc[df_team["name"] == name, "team"].iloc[0]
+        lang = df_team.loc[df_team["norm_name"] == name, "team"].iloc[0]
         used_languages_late.add(lang)
         sat_late_late_team.append(name)
 
@@ -601,10 +687,10 @@ def assign_saturday_shifts(df_week, df_history, df_team, grouped_smt_team, shift
         fair_smt = select_fairest(
             df_history, df_team, saturday_eligible,
             shift_type="saturday_early_late",
-            top_n=top_n_saturday,
-            required_count=smt_requirement,
+            k=k,
             filter_func=lambda row: row["team"] not in used_languages_late and row["trained_social"],
-            duplicate_teams=False
+            duplicate_teams=False,
+            cooldown_days=6
         )
         print("✅ SMTs selected for fairness (Sat 13):", fair_smt["name"].tolist())
 
@@ -613,7 +699,7 @@ def assign_saturday_shifts(df_week, df_history, df_team, grouped_smt_team, shift
             print("🔁 RETURNING EMPTY LISTS")
             return df_week, [], []
         smt_name = fair_smt["name"].iloc[0]
-        lang = df_team.loc[df_team["name"] == smt_name, "team"].iloc[0]
+        lang = df_team.loc[df_team["norm_name"] == smt_name, "team"].iloc[0]
         used_languages_late.add(lang)
         sat_early_late_team.append(smt_name)
     print("📉 SMTs after filtering for 15:00:", fair_sat15["name"].tolist())
@@ -629,17 +715,18 @@ def assign_saturday_shifts(df_week, df_history, df_team, grouped_smt_team, shift
         fair_sat13 = select_fairest(
             df_history, df_team, saturday_eligible,
             shift_type="saturday_early_late",
-            top_n=top_n_saturday,
-            required_count=1,
+            k=k,
             filter_func=lambda row: row["team"] not in used_languages_late,
-            duplicate_teams=False
+            duplicate_teams=False,
+            cooldown_days=6
         )
+
         if fair_sat13.empty:
             print("❌ No non-SMT candidate for Saturday 13:00 (early-late)")
             print("🔁 RETURNING EMPTY LISTS")
             return df_week, [], []
         name = fair_sat13["name"].iloc[0]
-        lang = df_team.loc[df_team["name"] == name, "team"].iloc[0]
+        lang = df_team.loc[df_team["norm_name"] == name, "team"].iloc[0]
         used_languages_late.add(lang)
         sat_early_late_team.append(name)
 
@@ -680,21 +767,30 @@ def assign_saturdays_and_rdo(df_week, df_team, shift_requirements, df_history, s
         df_team,
         candidates_mor,
         shift_type="saturday_morning",
-        top_n=requirement_mor * 2,
-        required_count=requirement_mor,
-        duplicate_teams=False
+        k=k,
+        duplicate_teams=False,
+        cooldown_days=6
     )
 
     for agent in sat_morning_team["name"]:
         assign_one_agent(df_week, "Saturday", morning_shift, agent)
-        team_row = df_team.loc[df_team["name"] == agent, "team"]
+        team_row = df_team.loc[df_team["norm_name"] == agent, "team"]
         if not team_row.empty:
             languages_morning_team.add(team_row.values[0])
         else:
             print(f"⚠️ Agent '{agent}' not found in df_team — cannot retrieve team info.")
 
     # ────────── Step 2: Gather all Saturday‐involved agents ──────────
-    all_saturday_agents = set(sat_early_late_team + sat_late_late_team + list(sat_morning_team))
+    all_saturday_agents = set(
+        (sat_early_late_team if isinstance(sat_early_late_team, list) else sat_early_late_team["name"].tolist())
+        + (sat_late_late_team if isinstance(sat_late_late_team, list) else sat_late_late_team["name"].tolist())
+        + ((sat_morning_team["name"].tolist()) if (
+                    'sat_morning_team' in locals() and hasattr(sat_morning_team, "columns")) else (
+            sat_morning_team if 'sat_morning_team' in locals() else []))
+    )
+
+    all_saturday_agents = [str(n).strip().replace("*", "").lower() for n in all_saturday_agents]
+
     possible_day_off = ["Wednesday", "Thursday", "Friday"]
 
     # ────────── Step 3: For each Saturday agent, assign one mid‐week RDO and fill missing Mon–Fri with "9" ──────────
@@ -719,7 +815,7 @@ def assign_saturdays_and_rdo(df_week, df_team, shift_requirements, df_history, s
 
         # Safely look up days_per_week (strip whitespace first)
         agent_clean = agent.strip()
-        team_row = df_team[df_team["name"].str.strip() == agent_clean]
+        team_row = df_team[df_team["norm_name"].str.strip() == agent_clean]
 
         if team_row.empty:
             print(f"⚠️ Agent '{agent}' not found in df_team; skipping their days_per_week lookup")
@@ -834,6 +930,22 @@ def report_smt_coverage(df_schedule, df_team):
     print("SMT report created!")
     return pivot
 
+def _to_name_list(x):
+    """Return a list[str] of names no matter if x is list/Series/DataFrame/single."""
+    if x is None:
+        return []
+    if isinstance(x, pd.DataFrame):
+        if x.empty:
+            return []
+        col = "name" if "name" in x.columns else x.columns[0]
+        return x[col].dropna().astype(str).tolist()
+    if hasattr(x, "dropna"):  # pandas Series
+        s = x.dropna()
+        return s.astype(str).tolist()
+    if isinstance(x, (list, tuple, set)):
+        return [str(v) for v in x if v is not None]
+    return [str(x)]
+
 def check_and_fill_smt(df_schedule, shift_requirements, df_team):
     smt_needed = {
         "9": 2,
@@ -868,7 +980,8 @@ def check_and_fill_smt(df_schedule, shift_requirements, df_team):
     return df_schedule
 
 def apply_weekly_shift_logic(df_schedule, df_team, grouped_smt_team, shift_requirements, df_history):
-    df_schedule["week_id"] = df_schedule["Day"].dt.strftime("%Y-W%U")  # e.g. '2025-W20'
+    # tag weeks
+    df_schedule["week_id"] = df_schedule["Day"].dt.strftime("%G-W%V")
     all_weeks = sorted(df_schedule["week_id"].unique())
 
     for week in all_weeks:
@@ -877,76 +990,123 @@ def apply_weekly_shift_logic(df_schedule, df_team, grouped_smt_team, shift_requi
         df_week = df_schedule[weekly_mask].copy()
         df_week["Weekday"] = df_week["Day"].dt.weekday
 
-        # 1. Assign weekday late-late and early-late shifts
+        # 1) Assign weekday late-late & early-late
         df_week, late_late_team, early_late_team = assign_both_late_shifts(
             df_week, df_history, df_team, grouped_smt_team, shift_requirements
         )
 
-        # ✅ Immediately update history for weekday shifts
-        df_history = update_history(
-            df_history, df_week,
-            weekday_late_late=late_late_team,
-            weekday_early_late=early_late_team
-        )
+        # ---------- SAFE helpers ----------
+        def _to_list_of_names(obj):
+            if obj is None:
+                return []
+            # DataFrame with a 'name' column
+            if hasattr(obj, "columns") and "name" in getattr(obj, "columns", []):
+                return obj["name"].astype(str).tolist()
+            # already a list/tuple/set of names
+            if isinstance(obj, (list, tuple, set)):
+                return [str(x) for x in obj]
+            # nothing usable
+            return []
 
-        # 2. Assign Saturday SMT shifts first
+        # ---------- Use your ACTUAL variables ----------
+        # 15:00 = late_late; 13:00 = early_late; 09:00 = morning
+        sat15_list = _norm_name_list(_to_list_of_names(locals().get("sat_late_late_team")))
+        sat13_list = _norm_name_list(_to_list_of_names(locals().get("sat_early_late_team")))
+        sat9_list = _norm_name_list(_to_list_of_names(locals().get("sat_morning_team")))
+
+        updates = {}
+        if sat15_list: updates["saturday_late_late"] = sat15_list
+        if sat13_list: updates["saturday_early_late"] = sat13_list
+        if sat9_list:  updates["saturday_morning"] = sat9_list
+
+        print("Saturday updates summary:", {k: len(v) for k, v in updates.items() if k.startswith("saturday_")})
+
+        if updates:
+            picked = set(sum(updates.values(), []))
+            cols = [
+                "name",
+                "count_saturday_late_late", "latest_saturday_late_late",
+                "count_saturday_early_late", "latest_saturday_early_late",
+                "count_saturday_morning", "latest_saturday_morning",
+            ]
+            before = df_history.loc[df_history["name"].isin(picked), cols].copy()
+
+            df_history = update_history(df_history, df_week, **updates)
+
+            after = df_history.loc[df_history["name"].isin(picked), cols]
+            print("Δ Saturday update (picked only):")
+            print(after.merge(before, on="name", suffixes=("_after", "_before")))
+
+        print(df_history.loc[df_history["name"].isin(_to_list_of_names(late_late_team)),
+        ["name", "count_late_late", "latest_late_late"]].head())
+
+        print("📈 after weekday update\n",
+              df_history[["name", "count_late_late", "count_early_late"]]
+              .sort_values(["count_late_late", "count_early_late"], ascending=False)
+              .head(10))
+
+        # 2) Assign Saturday SMT (15 & 13)
         result = assign_saturday_shifts(
-            df_week,
-            df_history,
-            df_team,
-            grouped_smt_team,
-            shift_requirements,
-            top_n_saturday=3
+            df_week, df_history, df_team, grouped_smt_team, shift_requirements, top_n_saturday=3
         )
-
         if result is None:
             raise RuntimeError("❌ assign_saturday_shifts() returned None unexpectedly!")
-
         df_week, sat_late_late_team, sat_early_late_team = result
 
-        # ✅ Immediately update history with those SMT Saturday assignments
-        df_history = update_history(
-            df_history, df_week,
-            saturday_late_late=sat_late_late_team,
-            saturday_early_late=sat_early_late_team
-        )
-
-        # 3. Now assign Saturday morning + remaining shifts
+        # Optional: also assign Saturday morning + RDOs (depends on 15/13 picks)
         df_week, sat_morning_team, sat_late_late_team, sat_early_late_team = assign_saturdays_and_rdo(
             df_week,
             df_team,
             shift_requirements,
-            df_history,
+            df_history,              # use the freshest history
             sat_late_late_team,
             sat_early_late_team
         )
+        sat9_list = _to_name_list(sat_morning_team)
+        sat13_list = _to_name_list(sat_early_late_team)
+        sat15_list = _to_name_list(sat_late_late_team)
 
-        print("🧪 SMT assigned to Sat 15:", sat_late_late_team)
-        print("🧪 SMT assigned to Sat 13:", sat_early_late_team)
-        print("🧪 Sat morning team:", sat_morning_team)
-        print(df_week[df_week["Day"].dt.dayofweek == 5][["Day", "Employee", "shift_time"]])
+        updates = {}
+        if sat15_list: updates["saturday_late_late"] = sat15_list
+        if sat13_list: updates["saturday_early_late"] = sat13_list
+        if sat9_list:  updates["saturday_morning"] = sat9_list
 
-        # ✅ Final Saturday history update after morning assignments
-        df_history = update_history(
-            df_history, df_week,
-            saturday_morning=sat_morning_team
-        )
+        if updates:
+            # sanity: before→after diff for the exact picks
+            picked = set(sum(updates.values(), []))
+            cols = ["name",
+                    "count_saturday_late_late", "latest_saturday_late_late",
+                    "count_saturday_early_late", "latest_saturday_early_late",
+                    "count_saturday_morning", "latest_saturday_morning"]
+            before = df_history.loc[df_history["name"].isin(picked), cols].copy()
 
-        print("📈 History counts after update:\n",
-              df_history[["name", "count_saturday_late_late"]].sort_values("count_saturday_late_late", ascending=False))
+            df_history = update_history(df_history, df_week, **updates)
 
-        # 3. Apply staffing rules
+            after = df_history.loc[df_history["name"].isin(picked), cols]
+            print("Δ Saturday update (picked only):")
+            print(after.merge(before, on="name", suffixes=("_after", "_before")))
+
+        print("📈 after saturday update\n",
+              df_history[
+                  ["name", "count_saturday_late_late", "count_saturday_early_late", "count_saturday_morning"]
+              ]
+              .sort_values(["count_saturday_late_late", "count_saturday_early_late", "count_saturday_morning"],
+                           ascending=False)
+              .head(10))
+
+        # 3) Apply staffing rules (these should not reassign SMT late shifts)
         df_week = enforce_minimum_staffing(df_week, shift_requirements)
         df_week = enforce_max_days_off(df_week, df_team)
         df_week = check_and_fill_smt(df_week, shift_requirements, df_team)
 
-        # 4. Write back into global schedule
-        df_schedule.loc[weekly_mask] = df_week
+        # 4) Write back this week's assignments into the master schedule ONCE
+        df_schedule.loc[weekly_mask, :] = df_week
 
-        print(df_history[["name", "count_late_late", "latest_late_late"]].sort_values("count_late_late",
-                                                                                      ascending=False).head(5))
-
-        # Update history with all current week assignments
+        # Quick visibility (fix quotes)
+        cols = ["name", "count_late_late", "latest_late_late"]
+        print(df_history[["name", "count_late_late", "latest_late_late"]]
+              .sort_values(["count_late_late", "latest_late_late"])
+              .head(10))
 
     print("\n📅 Weekly shift logic complete for all weeks.")
     return df_history, df_schedule
@@ -1101,7 +1261,6 @@ import sys
 def dbg(*args):
     print(*args, flush=True, file=sys.stdout)
 
-# then replace every print(...) in load_employee_history with dbg(...)
 def load_employee_history(file_path):
 
     from dateutil.parser import parse
@@ -1225,7 +1384,7 @@ def check_mismatches(excel_file_path, df_history, schedule_sheet, df_team):
 
         holiday_sheet = pd.read_excel(excel_file_path, sheet_name="Holidays", usecols=usecols)
 
-    team_names = [str(name).strip().lower() for name in df_team["name"].dropna()]
+    team_names = [str(name).strip().lower() for name in df_team["norm_name"].dropna()]
     previous_schedule_names = []
     history_names = [str(name).strip().lower() for name in df_history["name"].dropna()]
     holiday_names = []
@@ -1276,69 +1435,76 @@ def check_mismatches(excel_file_path, df_history, schedule_sheet, df_team):
 def normalize(name):
     return str(name).strip().lower()
 
-
-def fill_schedule(df_team, df_schedule, destination_file_path, sheet_name):
+def fill_schedule(df_team, df_schedule, destination_file_path, sheet_name, name_map):
     print(f"📂 Filling schedule into: {destination_file_path}")
     print("📋 Sheet name:", sheet_name)
     print("📊 df_schedule shape:", df_schedule.shape)
     print("👥 df_schedule Employees:", df_schedule['Employee'].unique())
     wb = openpyxl.load_workbook(destination_file_path)
     sheet = wb[sheet_name]
-    staff_list = df_team["name"].tolist()
+    staff_list = df_team["norm_name"].tolist()
 
-    for staff in staff_list:
-        df_agent = df_schedule[df_schedule["Employee"] == staff]
-        agent_row = df_team[df_team["name"] == staff]
+    print("👤 Example mapping:")
+    for nm in staff_list[:5]:
+        print(f"norm={nm!r} → excel={name_map.get(nm)!r}")
 
+    for norm_name in staff_list:
+        df_agent = df_schedule[df_schedule["Employee"] == norm_name]
+        if df_agent.empty:
+            print(f"⚠️ No schedule for: {norm_name}")
+            continue
+
+        # translate back to Excel name for row lookup
+        excel_name = name_map.get(norm_name)
+        if not excel_name:
+            print(f"⚠️ No mapping for: {norm_name}")
+            continue
+
+        agent_row = df_team[df_team["name"] == excel_name]
         if agent_row.empty:
-            print(f"⚠️ No schedule for: {staff}")
-            continue  # skip if agent is not found
+            print(f"⚠️ No Excel row for: {excel_name}")
+            continue
 
         hours_per_week = agent_row["hours_per_week"].values[0]
         days_per_week = agent_row["days_per_week"].values[0]
 
+        # --- row lookup in column B, starting row 2 ---
         row_to_fill = None
-        for row in sheet.iter_rows(min_row=3, max_col=2):
-            if row[1].value == staff:
-                row_to_fill = row[1].row
+        for col_cells in sheet.iter_cols(min_col=2, max_col=2, min_row=2):
+            for cell in col_cells:
+                cell_value = str(cell.value).replace("\u00A0", " ").strip() if cell.value else ""
+                if cell_value == excel_name or cell_value.rstrip("*").lower() == excel_name.rstrip("*").lower():
+                    row_to_fill = cell.row
+                    break
+            if row_to_fill is not None:
                 break
 
         if row_to_fill is None:
-            print(f"⚠️ Could not find row for: {staff}")
+            print(f"⚠️ Could not find row for: {excel_name}")
             continue
 
+        # --- write shifts for this agent (your code continues here) ---
         for col in range(3, sheet.max_column + 1):
             cell = sheet.cell(row=1, column=col)
             wb_date = cell.value
-
-            if wb_date is None:
-                break  # no date = no shift
-
-            if not isinstance(wb_date, (datetime, date)):
-                continue  # skip non-date headers
+            if wb_date is None: break
+            if not isinstance(wb_date, (datetime, date)): continue
 
             wb_day = pd.to_datetime(wb_date).date()
-            for _, row in df_agent.iterrows():
-                row_day = pd.to_datetime(row["Day"]).date()
+            for _, r in df_agent.iterrows():
+                row_day = pd.to_datetime(r["Day"]).date()
                 if wb_day == row_day:
-                    shift = row["shift_time"]
-
+                    shift = r["shift_time"]
                     if isinstance(shift, str) and shift.isdigit():
                         start_hour = int(shift)
-
-                        # use 5 days for late shifts
-                        if classify_shift(shift) in {"early_late", "late_late"}:
-                            days_used = 5
-                        else:
-                            days_used = days_per_week
-
+                        days_used = 5 if classify_shift(shift) in {"early_late", "late_late"} else days_per_week
                         hours_per_day = hours_per_week / days_used
                         end_hour = start_hour + hours_per_day + 1
-
                         shift_str = f"{start_hour:02.0f}:00 - {int(end_hour):02.0f}:00"
                         sheet.cell(row=row_to_fill, column=col).value = shift_str
                     else:
                         sheet.cell(row=row_to_fill, column=col).value = shift
+
     print("✅ Writing file to:", destination_file_path)
     print("✅ Schedule preview:\n", df_schedule.head(10))
 
@@ -1439,31 +1605,55 @@ def fill_history_tab(df_history, excel, sheet_name="History", all_months=False):
             shifts_15_weekday   = []
             shifts_15_saturday  = []
             shifts_9_saturday   = []
-
             for col in range(3, schedule_sheet.max_column + 1):
                 shift = schedule_sheet.cell(row=row_to_pull, column=col).value
-                if isinstance(shift, str) and ":" in shift:
-                    shift_start = shift.split(":")[0]
-                else:
-                    shift_start = shift  # keep original if it's a raw value like "AL"
 
-                if shift_start not in {"13", "15", "9"}:
-                    print(f"shift start value incorrect {shift_start}")
+                shift_start = None
+
+                if isinstance(shift, str):
+                    s = shift.strip().upper()
+
+                    # Skip markers that are not shifts
+                    if s in {"RDO", "RRDO", "AL", "OFF"} or not s:
+                        print(f"⚠️ Non-working marker {s!r}, skipping")
+                        continue
+
+                    # Handle formats like "08:00-17:00"
+                    if "-" in s and s[0:2].isdigit():
+                        shift_start = s[0:2]  # take first two chars → "08", "09", "13", "15"
+                    elif s.isdigit():
+                        shift_start = s
+                elif isinstance(shift, (int, float)):
+                    shift_start = str(int(shift))
+
+                if not shift_start:
+                    print(f"⚠️ Unrecognized shift value {shift!r}, skipping")
+                    continue
+
+                # normalize to plain hour
+                if shift_start.startswith("0"):
+                    shift_start = shift_start.lstrip("0")
+
+                # accept 8, 9, 13, 15
+                if shift_start not in {"8", "9", "13", "15"}:
+                    print(f"⚠️ Shift start {shift_start!r} not tracked, skipping")
                     continue
 
                 date_value = schedule_sheet.cell(row=1, column=col).value
                 weekday_name = date_value.strftime("%A") if isinstance(date_value, datetime) else "Unknown"
                 print(f"\n📅 Evaluating date: {date_value}, Weekday: {weekday_name}")
-                print(f"🔎 Raw shift value: {shift_start!r}")
+                print(f"🔎 Raw shift value: {shift!r} → Parsed: {shift_start!r}")
 
-                # Try to extract an integer hour from shift_start
-                if isinstance(shift_start, str) and ":" in shift_start:
-                    try:
-                        shift_start = int(shift_start.split(":")[0])
-                        print(f"✅ Parsed shift_start to integer: {shift_start}")
-                    except Exception as e:
-                        print(f"❌ Failed to parse shift_start {shift_start!r} → {e}")
-                        continue
+                shift_start = int(shift_start)
+
+
+                date_value = schedule_sheet.cell(row=1, column=col).value
+                weekday_name = date_value.strftime("%A") if isinstance(date_value, datetime) else "Unknown"
+                print(f"\n📅 Evaluating date: {date_value}, Weekday: {weekday_name}")
+                print(f"🔎 Raw shift value: {shift!r} → Parsed: {shift_start!r}")
+
+                # now shift_start is a clean string like "9", "13", or "15"
+                shift_start = int(shift_start)
 
                 # Now classify
                 try:
@@ -1536,7 +1726,6 @@ def fill_history_tab(df_history, excel, sheet_name="History", all_months=False):
     wb.save(excel)
     print(f"✅ fill_history_tab: saved History into {excel!r}")
 
-
 def print_avg_days_worked(df_schedule):
     temp = df_schedule.copy()
     temp["Week"] = temp["Day"].dt.isocalendar().week
@@ -1563,8 +1752,11 @@ def run_schedule(uploaded_path, output_folder):
     # 2️⃣ Now load EVERYTHING from the copy
     shift_requirements = load_shift_requirements(excel, sheet_name="Shifts")
 
-    df_team   = load_employee_list(excel)
-    df_history, _, schedule_sheet = load_employee_history(excel)
+    df_team, name_map = load_employee_list(excel)
+    print("name_map sample:", list(name_map.items())[:5])
+    # RIGHT side must be the exact Excel strings (with caps, possibly trailing *)
+
+    df_history, unrec_cells, schedule_sheet = load_employee_history(excel)
 
     # 3️⃣ Update that copy’s History tab
     print("📥 run_schedule: about to call fill_history_tab…")
@@ -1576,7 +1768,7 @@ def run_schedule(uploaded_path, output_folder):
     print(repr(val))
 
     # 4️⃣ Re-load history/sheet from the same copy to pick up your writes
-    df_history, unrec_cells, schedule_sheet = load_employee_history(excel)
+
 
     # 5️⃣ Compute mismatches against that now-up-to-date copy
     mismatches = check_mismatches(excel,
@@ -1618,7 +1810,7 @@ def run_schedule(uploaded_path, output_folder):
         by="count_saturday_late_late", ascending=False))
 
     # 9️⃣ Finally fill that new sheet in the SAME copy
-    fill_schedule(df_team, df_schedule, excel, sheet_name)
+    fill_schedule(df_team, df_schedule, excel, sheet_name, name_map)
 
     # 🔟 Return everything
     return sheet_name, start_date, end_date, full_date_range, mismatches, unrec_cells, dest
